@@ -1,0 +1,314 @@
+# H. Performance, Capacity, dan Operational Trade-off
+
+> Bottleneck performance di production bukan selalu di tempat yang kita asumsikan. Satu-satunya cara mengetahui di mana bottleneck sesungguhnya adalah dengan data — bukan intuisi. Dokumen ini membahas pendekatan sistematis untuk mendiagnosa, mengambil keputusan, dan mengelola pertumbuhan kapasitas.
+
+---
+
+## 1. Mendiagnosa Bottleneck: Framework "USE" dan "RED"
+
+Sebelum mengambil tindakan apapun, kita perlu tahu jenis bottleneck yang dihadapi.
+
+**USE Method** (untuk resource-level diagnosis):  
+- **U**tilization: Seberapa sibuk resource ini? (%)  
+- **S**aturation: Seberapa banyak work yang queued/waiting?  
+- **E**rrors: Apakah ada error yang terjadi?
+
+**RED Method** (untuk service-level diagnosis):  
+- **R**ate: Berapa banyak request per second?  
+- **E**rrors: Berapa error rate?  
+- **D**uration: Berapa latency?
+
+```
+Bottleneck diagnosis flowchart:
+
+Latency tinggi?
+├── Error rate tinggi juga? → Kemungkinan downstream dependency failure
+│   └── Cek: database slow query? Redis timeout? External API down?
+│
+└── Error rate normal, hanya latency? → Saturasi resource atau inefficiency
+    ├── CPU tinggi? → Compute-bound; cek: inefficient algorithm, N+1 query
+    ├── Memory tinggi? → Memory-bound; cek: memory leak, large payload
+    ├── DB connections exhausted? → Connection pool; cek: connection leak, pool too small
+    └── Semua metric normal tapi latency tinggi? → Network latency atau cold start
+```
+
+---
+
+## 2. Penyebab Bottleneck yang Paling Umum (dan Sering Diabaikan)
+
+### N+1 Query Problem
+
+```
+Symptom: Latency meningkat linear dengan jumlah data yang diambil
+Diagnosis: Database slow query log menunjukkan banyak query identik dalam satu request
+
+Contoh bad case (Laravel):
+  $orders = Order::all();
+  foreach ($orders as $order) {
+      echo $order->user->name;  // Query baru per order → N+1
+  }
+
+Fix:
+  $orders = Order::with('user')->get();  // Eager loading → 2 queries total
+  
+Impact: Request yang awalnya butuh 847ms (200 orders × 4ms per query) 
+        turun ke 23ms setelah eager loading
+```
+
+### Database Connection Pool Exhaustion
+
+```
+Symptom: Error 500 spike tiba-tiba tanpa deployment; resolves sendiri setelah beberapa menit
+Diagnosis: pg_stat_activity menunjukkan banyak connections di state 'idle in transaction'
+
+Root cause: Connection tidak di-release setelah selesai digunakan
+            (misalnya karena exception handling yang tidak proper)
+
+Fix:
+  1. Immediate: Restart application untuk flush stale connections
+  2. Root cause: Audit semua database transaction untuk proper try/finally
+  3. Config: Set statement_timeout dan idle_in_transaction_session_timeout di PostgreSQL
+  
+PostgreSQL config:
+  statement_timeout = '30s'              # Kill query yang berjalan > 30 detik
+  idle_in_transaction_session_timeout = '60s'  # Kill connection idle in transaction > 60 detik
+  lock_timeout = '5s'                    # Fail fast daripada deadlock wait
+```
+
+### PHP OPcache Misconfiguration
+
+```
+Symptom: Latency tinggi tapi CPU normal; setelah container restart, latency membaik sesaat
+         lalu naik lagi
+Diagnosis: OPcache miss rate tinggi
+
+PHP OPcache config yang tepat untuk production:
+  opcache.enable = 1
+  opcache.memory_consumption = 256        ; MB; default 128 sering tidak cukup
+  opcache.max_accelerated_files = 20000   ; Harus > jumlah PHP files di project
+  opcache.validate_timestamps = 0         ; WAJIB 0 di production; 1 menyebabkan disk I/O per request
+  opcache.revalidate_freq = 0             ; Irrelevant karena validate_timestamps=0
+  opcache.fast_shutdown = 1
+  
+Catatan: opcache.validate_timestamps = 1 di production adalah bottleneck umum
+         yang sering tidak terdeteksi. Setiap request menyebabkan stat() syscall
+         untuk setiap file PHP — ribanya signifikan di aplikasi besar.
+```
+
+---
+
+## 3. Scaling: Kapan dan Bagaimana
+
+### Horizontal vs. Vertical Scaling: Framework Keputusan
+
+```
+Vertical Scaling (scale up — instance lebih besar):
+  ✅ Baik untuk: Stateful services (database, cache) yang tidak mudah di-horizontalkan
+  ✅ Baik untuk: Bottleneck yang terisolasi di satu dimension (misalnya memory)
+  ❌ Batas: Ada ceiling (terbesar yang tersedia); memerlukan restart
+  ❌ Batas: Tidak ada fault tolerance improvement
+
+Horizontal Scaling (scale out — lebih banyak instance):
+  ✅ Baik untuk: Stateless application tier
+  ✅ Baik untuk: Fault tolerance (satu instance down, lainnya tetap melayani)
+  ❌ Memerlukan: Aplikasi benar-benar stateless; shared session storage; distributed coordination
+  ❌ Tidak gratis: Lebih banyak instance = lebih banyak config management, log aggregation, dsb.
+```
+
+### ECS Auto Scaling (Application Tier)
+
+```hcl
+# Terraform — ECS Service Auto Scaling
+
+resource "aws_appautoscaling_target" "api" {
+  max_capacity       = 20
+  min_capacity       = 2
+  resource_id        = "service/myapp-production/myapp-api"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+}
+
+# Scale out berdasarkan CPU
+resource "aws_appautoscaling_policy" "cpu_scale_out" {
+  name               = "cpu-scale-out"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.api.resource_id
+  scalable_dimension = aws_appautoscaling_target.api.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.api.service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    target_value       = 65.0  # Scale out saat CPU rata-rata > 65%
+    # 65% dipilih (bukan 80%) untuk memberikan headroom sebelum saturation.
+    # Scale out event membutuhkan 1-3 menit; tanpa headroom, kita scale out
+    # setelah user sudah merasakan degradasi.
+    
+    scale_in_cooldown  = 300  # 5 menit: tunggu sebelum scale in
+    scale_out_cooldown = 60   # 1 menit: scale out lebih agresif
+
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    }
+  }
+}
+
+# Scale out berdasarkan ALB request count (leading indicator yang lebih baik dari CPU)
+resource "aws_appautoscaling_policy" "request_count_scale_out" {
+  name               = "request-count-scale-out"
+  policy_type        = "TargetTrackingScaling"
+  resource_id        = aws_appautoscaling_target.api.resource_id
+  scalable_dimension = aws_appautoscaling_target.api.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.api.service_namespace
+
+  target_tracking_scaling_policy_configuration {
+    target_value = 1000  # 1000 requests per menit per task
+    # ALBRequestCountPerTarget: lebih baik dari CPU karena ini leading indicator.
+    # CPU meningkat SETELAH request meningkat; request count meningkat BERSAMAAN
+    # dengan traffic spike.
+
+    predefined_metric_specification {
+      predefined_metric_type = "ALBRequestCountPerTarget"
+      resource_label         = "${var.alb_arn_suffix}/${var.target_group_arn_suffix}"
+    }
+  }
+}
+```
+
+### Database Scaling: Strategi Bertahap
+
+```
+Tahap 1: Optimize sebelum scale
+  - Index yang tepat (EXPLAIN ANALYZE adalah tool utama)
+  - Query optimization (N+1, unnecessary full table scans)
+  - Connection pooling (PgBouncer jika connection count jadi masalah)
+  - OPcache tuning
+  
+  Alasan: Vertical/horizontal scale yang dilakukan sebelum optimization
+  hanya membeli waktu — masalah yang sama akan muncul kembali di scale yang lebih besar.
+
+Tahap 2: Vertical scale (jika optimization tidak cukup)
+  db.t4g.medium → db.r6g.large → db.r6g.xlarge
+  Trigger: CPU > 70% sustained OR memory < 20% free
+
+Tahap 3: Read replicas (jika write/read ratio sudah jelas)
+  - Pisahkan read-heavy queries (reporting, analytics) ke replica
+  - Connection string berbeda untuk read vs. write
+  - Laravel: configure read/write connections secara eksplisit
+
+Tahap 4: Caching layer (ElastiCache)
+  - Cache result dari expensive queries yang read-heavy dan data tidak sering berubah
+  - Invalidation strategy harus jelas: event-based > TTL-based untuk data transaksional
+
+Tahap 5: Database sharding atau alternative storage
+  - Hanya jika semua tahap di atas sudah dilakukan dan masih tidak cukup
+  - Kompleksitas yang sangat tinggi; jangan lompat ke sini tanpa exhausting tahap 1-4
+```
+
+---
+
+## 4. Cost-Performance Trade-off: Keputusan yang Konkret
+
+### Spot Instance untuk Worker Services
+
+```hcl
+# Background workers (queue processing) adalah kandidat ideal untuk Spot Instance:
+# - Interruptible (jika Spot di-terminate, job bisa di-retry)
+# - Tidak perlu high availability individual (queue memberikan durability)
+# - Cost saving: 60-80% vs. On-Demand
+
+resource "aws_ecs_capacity_provider" "spot" {
+  name = "spot-worker"
+
+  auto_scaling_group_provider {
+    auto_scaling_group_arn = aws_autoscaling_group.worker_spot.arn
+    
+    managed_scaling {
+      status                    = "ENABLED"
+      target_capacity           = 80  # Target 80% utilized (buffer untuk burst)
+      minimum_scaling_step_size = 1
+      maximum_scaling_step_size = 5
+    }
+  }
+}
+
+# API service menggunakan On-Demand (tidak interruptible)
+# Worker service menggunakan Spot (interruptible, retry-able)
+# Catatan: Jika worker job tidak idempotent, jangan gunakan Spot.
+```
+
+### Rightsizing: Audit Bulanan
+
+```bash
+# Script: identify over-provisioned ECS tasks
+# Jalankan setelah 4 minggu production data tersedia
+
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/ECS \
+  --metric-name CPUUtilization \
+  --dimensions Name=ClusterName,Value=myapp-production \
+  --start-time $(date -d '30 days ago' -u +%Y-%m-%dT%H:%M:%SZ) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  --period 3600 \
+  --statistics Average,Maximum \
+  --output table
+
+# Jika CPU average < 20% selama 30 hari:
+# → Task over-provisioned; reduce CPU reservation
+# Jika CPU maximum < 40%:
+# → Task significantly over-provisioned; consider halving the allocation
+# Jika CPU average > 60%:
+# → Approaching saturation; consider scaling up atau horizontal scaling
+```
+
+### Cold Start Mitigation
+
+```
+Masalah: ECS container yang baru di-spawn membutuhkan waktu untuk "warm up"
+         (PHP OPcache compilation, connection pool establishment, cache warming)
+         selama waktu ini, latency tinggi.
+
+Solusi 1: Keep minimum capacity > 0 (jangan scale ke 0 di production)
+  Biaya: ~$30-50/bulan untuk 1 task yang selalu running
+  Benefit: Tidak ada cold start saat traffic tiba-tiba naik
+
+Solusi 2: Predictive scaling berdasarkan scheduled events
+  Jika traffic peak sudah bisa diprediksi (misal: tiap hari 09:00-10:00):
+  aws application-autoscaling put-scheduled-action \
+    --service-namespace ecs \
+    --scalable-dimension ecs:service:DesiredCount \
+    --resource-id service/myapp-production/myapp-api \
+    --scheduled-action-name morning-scale-out \
+    --schedule "cron(0 1 * * ? *)" \  # 01:00 UTC = 08:00 WIB
+    --scalable-target-action MinCapacity=5,MaxCapacity=20
+
+Solusi 3: Health check start period yang memadai
+  --health-check-grace-period 60
+  Mencegah ALB menandai container baru sebagai unhealthy sebelum fully initialized
+```
+
+---
+
+## 5. Capacity Planning: Proaktif bukan Reaktif
+
+```
+Weekly metrics review (setiap Senin, 30 menit):
+  - CPU dan memory trend 7 hari terakhir
+  - Database storage growth rate (project: kapan kita hit 80%?)
+  - Request count trend
+  - Error budget consumption
+
+Monthly capacity review:
+  - Trend 4 minggu terakhir
+  - Upcoming events yang akan meningkatkan traffic
+  - Cost per request trend (apakah cost-efficiency membaik atau memburuk?)
+  - Evaluate apakah ada rightsizing opportunity
+
+Kapasitas minimum yang harus selalu tersedia:
+  Application: 30% headroom dari peak daily traffic
+  Database CPU: Tidak boleh melebihi 60% sustained
+  Database storage: Alert di 70%, scale di 80%
+  Cache: Hit rate harus > 80%; jika turun, investigate TTL dan eviction policy
+```
+
+---
+
+*Performance engineering yang baik adalah disiplin yang berkelanjutan — bukan sprint satu kali yang dilakukan saat sistem sudah dalam kondisi krisis. Sistem yang dimonitor dengan baik memberikan sinyal jauh sebelum degradasi mencapai user.*

@@ -1,0 +1,522 @@
+name: Production Release Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+# Prevent concurrent deployments to production.
+# New push cancels in-progress runs on PRs, but NOT on main (let production deploys finish).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  AWS_REGION: ap-southeast-1
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-southeast-1.amazonaws.com
+  ECR_REPOSITORY: myapp-api
+  # Immutable tag: git SHA ensures we always know exactly what is running in production
+  IMAGE_TAG: ${{ github.sha }}
+
+permissions:
+  contents: read
+  id-token: write   # Required for OIDC-based AWS authentication (no long-lived AWS keys)
+  security-events: write  # Required for uploading Trivy SARIF to GitHub Security tab
+  pull-requests: write    # Required for posting review comments on PRs
+
+jobs:
+  # ─────────────────────────────────────────────
+  # STAGE 1: Build, Lint, Unit Tests
+  # ─────────────────────────────────────────────
+  build-and-test:
+    name: "Stage 1 · Build & Test"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for accurate git blame / changelog
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: pdo, pdo_pgsql, redis, opcache
+          coverage: xdebug
+          tools: composer:v2, phpstan, php-cs-fixer
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: composer-${{ hashFiles('composer.lock') }}
+          restore-keys: composer-
+
+      - name: Install dependencies (no dev in production artifact)
+        run: composer install --no-interaction --prefer-dist --optimize-autoloader
+
+      - name: PHP code style check (CS Fixer)
+        run: php-cs-fixer fix --dry-run --diff --config=.php-cs-fixer.php
+        continue-on-error: false
+
+      - name: Static analysis — PHPStan level 8
+        run: vendor/bin/phpstan analyse --level=8 --no-progress --error-format=github
+        # Level 8 is intentional. Lower levels give false confidence.
+        # Exceptions are tracked in phpstan-baseline.neon with explicit justification.
+
+      - name: Run unit tests with coverage
+        run: |
+          vendor/bin/phpunit \
+            --testsuite=Unit \
+            --coverage-clover=coverage.xml \
+            --coverage-min=80
+        env:
+          APP_ENV: testing
+          DB_CONNECTION: sqlite
+          DB_DATABASE: ":memory:"
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          file: coverage.xml
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # ─────────────────────────────────────────────
+  # STAGE 2: Security Scanning
+  # ─────────────────────────────────────────────
+  security-scan:
+    name: "Stage 2 · Security Scan"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    needs: build-and-test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Scan source code for hardcoded secrets
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          scanners: "secret"
+          severity: "MEDIUM,HIGH,CRITICAL"
+          exit-code: "1"
+          # A hardcoded secret in source = pipeline stop, no exceptions.
+          # If a legitimate secret is flagged, it must be explicitly ignored
+          # via .trivyignore with a documented justification and expiry date.
+
+      - name: Build Docker image for vulnerability scanning
+        run: |
+          docker build \
+            --file containerization/Dockerfile \
+            --target production \
+            --tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:scan-${{ env.IMAGE_TAG }} \
+            .
+
+      - name: Scan Docker image for CVEs
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:scan-${{ env.IMAGE_TAG }}"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "HIGH,CRITICAL"
+          exit-code: "1"
+          ignore-unfixed: false
+          # We do NOT use ignore-unfixed: true in production pipeline.
+          # Unfixed CVEs in base images are a signal to update the base image, not to ignore the signal.
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()  # Upload even if scan failed, so team can see what was found
+        with:
+          sarif_file: "trivy-results.sarif"
+
+      - name: Dependency audit (composer audit)
+        run: composer audit --no-dev --locked
+
+  # ─────────────────────────────────────────────
+  # STAGE 3: Build and Push Docker Image
+  # ─────────────────────────────────────────────
+  build-image:
+    name: "Stage 3 · Build & Push Image"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    needs: security-scan
+    outputs:
+      image-uri: ${{ steps.build.outputs.image-uri }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          # OIDC-based auth: no long-lived AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY
+          # in GitHub secrets. Credentials are temporary and scoped to this workflow run.
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx (for layer caching)
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push to ECR
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: containerization/Dockerfile
+          target: production
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+          # Note: 'latest' is a convenience alias only. Deployments ALWAYS use
+          # the SHA-based immutable tag, never 'latest'.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            GIT_SHA=${{ github.sha }}
+            GIT_REF=${{ github.ref_name }}
+          provenance: true   # SLSA provenance attestation
+          sbom: true         # Software Bill of Materials
+
+      - name: Output image URI
+        run: echo "image-uri=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}" >> $GITHUB_OUTPUT
+
+  # ─────────────────────────────────────────────
+  # STAGE 4: Integration Tests
+  # ─────────────────────────────────────────────
+  integration-test:
+    name: "Stage 4 · Integration Tests"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    needs: build-image
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: testdb
+          POSTGRES_USER: testuser
+          POSTGRES_PASSWORD: testpassword
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: pdo, pdo_pgsql, redis
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist
+
+      - name: Run database migrations
+        run: php artisan migrate --force
+        env:
+          APP_ENV: testing
+          DB_HOST: 127.0.0.1
+          DB_PORT: 5432
+          DB_DATABASE: testdb
+          DB_USERNAME: testuser
+          DB_PASSWORD: testpassword
+
+      - name: Run integration tests
+        run: |
+          vendor/bin/phpunit \
+            --testsuite=Integration \
+            --log-junit integration-test-results.xml
+        env:
+          APP_ENV: testing
+          DB_HOST: 127.0.0.1
+          REDIS_HOST: 127.0.0.1
+
+      - name: Publish integration test results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: "Integration Test Results"
+          path: "integration-test-results.xml"
+          reporter: "java-junit"
+
+  # ─────────────────────────────────────────────
+  # STAGE 5: Deploy to Staging (auto)
+  # ─────────────────────────────────────────────
+  deploy-staging:
+    name: "Stage 5 · Deploy to Staging"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    needs: integration-test
+    environment:
+      name: staging
+      url: https://staging.yourdomain.com
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_STAGING_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update ECS service (Blue/Green via CodeDeploy)
+        run: |
+          # Update ECS task definition with new image
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition myapp-api-staging \
+            --query 'taskDefinition' \
+            --output json)
+          
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | jq \
+            --arg IMAGE "${{ needs.build-image.outputs.image-uri }}" \
+            '.containerDefinitions[0].image = $IMAGE |
+             del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+          
+          NEW_TASK_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          
+          echo "New task definition ARN: $NEW_TASK_ARN"
+          
+          aws ecs update-service \
+            --cluster myapp-staging \
+            --service myapp-api-staging \
+            --task-definition "$NEW_TASK_ARN" \
+            --force-new-deployment
+
+      - name: Wait for deployment to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster myapp-staging \
+            --services myapp-api-staging \
+            --no-paginate
+        timeout-minutes: 10
+
+      - name: Run staging smoke tests
+        run: |
+          # Critical path verification — not full test suite, but key user flows
+          STAGING_URL="https://staging.yourdomain.com"
+          
+          # 1. Health check
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$STAGING_URL/health")
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "FATAL: Health check returned $HTTP_STATUS"
+            exit 1
+          fi
+          
+          # 2. API responds with correct version
+          API_VERSION=$(curl -s "$STAGING_URL/api/version" | jq -r '.sha')
+          if [ "$API_VERSION" != "${{ env.IMAGE_TAG }}" ]; then
+            echo "FATAL: Deployed version mismatch. Expected ${{ env.IMAGE_TAG }}, got $API_VERSION"
+            exit 1
+          fi
+          
+          echo "Staging smoke tests passed."
+
+      - name: Notify Slack — staging deployment
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "✅ Staging deployment successful",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Staging deployment succeeded* — awaiting production approval\n*SHA:* `${{ env.IMAGE_TAG }}`\n*Ref:* `${{ github.ref_name }}`\n*By:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_DEVOPS_WEBHOOK }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # ─────────────────────────────────────────────
+  # STAGE 6: Production Approval Gate
+  # ─────────────────────────────────────────────
+  # This is handled by GitHub Environments with required reviewers.
+  # The 'production' environment in GitHub Settings must have:
+  #   - Required reviewers: [lead-devops, tech-lead] (at least 1 must approve)
+  #   - Wait timer: 0 minutes (approval is human-driven, not time-driven)
+  #   - Deployment branches: main only
+
+  # ─────────────────────────────────────────────
+  # STAGE 7: Deploy to Production (Blue/Green)
+  # ─────────────────────────────────────────────
+  deploy-production:
+    name: "Stage 7 · Deploy to Production"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    needs: [build-image, deploy-staging]
+    environment:
+      name: production
+      url: https://yourdomain.com
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (production — least privilege)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PRODUCTION_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          # Production role has ONLY:
+          # - ecs:RegisterTaskDefinition
+          # - ecs:UpdateService
+          # - ecs:DescribeServices
+          # - ecs:DescribeTaskDefinition
+          # - ecs:WaitUntilServicesStable
+          # It cannot: delete services, modify security groups, access secrets directly.
+
+      - name: Record deployment start in PagerDuty
+        run: |
+          curl -X POST https://events.pagerduty.com/v2/change/enqueue \
+            -H "Content-Type: application/json" \
+            -d '{
+              "routing_key": "${{ secrets.PAGERDUTY_INTEGRATION_KEY }}",
+              "payload": {
+                "summary": "Production deployment started: ${{ env.IMAGE_TAG }}",
+                "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'",
+                "custom_details": {
+                  "sha": "${{ env.IMAGE_TAG }}",
+                  "actor": "${{ github.actor }}",
+                  "workflow_run": "${{ github.run_id }}"
+                }
+              }
+            }'
+
+      - name: Deploy to production ECS (Blue/Green)
+        id: deploy
+        run: |
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition myapp-api-production \
+            --query 'taskDefinition' \
+            --output json)
+          
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | jq \
+            --arg IMAGE "${{ needs.build-image.outputs.image-uri }}" \
+            '.containerDefinitions[0].image = $IMAGE |
+             del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+          
+          NEW_TASK_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          
+          echo "new-task-arn=$NEW_TASK_ARN" >> $GITHUB_OUTPUT
+          
+          aws ecs update-service \
+            --cluster myapp-production \
+            --service myapp-api-production \
+            --task-definition "$NEW_TASK_ARN" \
+            --force-new-deployment
+
+      - name: Wait for production deployment to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster myapp-production \
+            --services myapp-api-production
+        timeout-minutes: 10
+
+      - name: Post-deploy production health verification
+        id: health-check
+        run: |
+          PROD_URL="https://yourdomain.com"
+          
+          # Poll health endpoint for 2 minutes — gives new tasks time to warm up
+          for i in $(seq 1 24); do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$PROD_URL/health")
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "Health check passed on attempt $i"
+              exit 0
+            fi
+            echo "Attempt $i: HTTP $HTTP_STATUS — retrying in 5s..."
+            sleep 5
+          done
+          
+          echo "FATAL: Production health check failed after 2 minutes"
+          exit 1
+
+      - name: Rollback on health check failure
+        if: failure() && steps.health-check.outcome == 'failure'
+        run: |
+          echo "Production health check failed. Initiating rollback..."
+          
+          # Roll back to previous task definition revision
+          PREVIOUS_TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition myapp-api-production \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text | sed 's/:[0-9]*$//')
+          
+          PREVIOUS_REVISION=$(aws ecs list-task-definitions \
+            --family-prefix myapp-api-production \
+            --sort DESC \
+            --query 'taskDefinitionArns[1]' \
+            --output text)
+          
+          aws ecs update-service \
+            --cluster myapp-production \
+            --service myapp-api-production \
+            --task-definition "$PREVIOUS_REVISION" \
+            --force-new-deployment
+          
+          echo "Rollback initiated to: $PREVIOUS_REVISION"
+
+      - name: Notify Slack — production result
+        if: always()
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '🚀 Production deployment successful' || '🔴 Production deployment FAILED — rollback initiated' }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*${{ job.status == 'success' && 'Production deployment succeeded' || '🚨 PRODUCTION DEPLOYMENT FAILED' }}*\n*SHA:* `${{ env.IMAGE_TAG }}`\n*By:* ${{ github.actor }}\n*Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_DEVOPS_WEBHOOK }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
