@@ -2,7 +2,7 @@
 
 > **Nama:** Rakha Febryza Rasendriya  
 > **Posisi:** Senior DevOps / Infrastructure Engineer  
-> **Repository ini** adalah proof-of-work profesional yang mendemonstrasikan cara berpikir arsitektural, penilaian risiko operasional, dan pengambilan keputusan infrastruktur pada level senior — bukan kumpulan tutorial atau portofolio generik.
+> **Repository ini** adalah proof-of-work profesional yang mendemonstrasikan cara berpikir arsitektural, penilaian risiko operasional, dan pengambilan keputusan infrastruktur pada level senior.
 
 ---
 
