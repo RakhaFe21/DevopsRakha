@@ -10,20 +10,7 @@
 
 Image yang di-deploy ke production adalah **image yang sama** yang sudah lolos test di CI dan di-deploy ke staging — bukan image yang di-build ulang. Ini bukan preferensi, ini adalah syarat minimum untuk reproducibility.
 
-```
-Dev Environment  →  CI/CD Build  →  ECR Registry
-                         │
-                    ┌────┴────┐
-                    │  Image  │ (tagged dengan SHA)
-                    │ :abc123 │
-                    └────┬────┘
-                         │
-              ┌──────────┼──────────┐
-              ▼          ▼          ▼
-           Staging    Preview    Production
-           (same     (same       (same
-           image)    image)      image)
-```
+![enter image description here](https://res.cloudinary.com/djyvswx7e/image/upload/v1774320515/Screenshot_2026-03-24_094804_xqsfin.png)
 
 **Apa yang berbeda antar environment bukan imagenya — melainkan konfigurasinya.** Database URL berbeda, log level berbeda, feature flags berbeda — tapi binary yang berjalan adalah identik.
 
