@@ -6,22 +6,7 @@
 
 ## 1. Stack Observability
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Grafana (Visualization)               │
-│  Dashboards · Alerting · Incident correlation           │
-└──────────────┬──────────────┬────────────────┬──────────┘
-               │              │                │
-        ┌──────▼──────┐ ┌─────▼──────┐ ┌──────▼───────┐
-        │ Prometheus  │ │    Loki    │ │    Tempo     │
-        │  (Metrics)  │ │  (Logs)   │ │  (Traces)    │
-        └──────┬──────┘ └─────┬──────┘ └──────┬───────┘
-               │              │                │
-        ┌──────▼──────────────▼────────────────▼───────┐
-        │           Application & Infrastructure        │
-        │  ECS Tasks · RDS · ALB · ElastiCache · OS    │
-        └──────────────────────────────────────────────┘
-```
+![enter image description here](https://res.cloudinary.com/djyvswx7e/image/upload/v1774320716/Screenshot_2026-03-24_095106_lgfr6b.png)
 
 **Mengapa Loki bukan ELK:**  
 Loki menggunakan label-based indexing (bukan full-text indexing seperti Elasticsearch). Ini berarti biaya storage dan compute jauh lebih rendah pada volume log yang besar. Trade-off: LogQL tidak sefleksibel Elasticsearch query language untuk full-text search. Untuk use case ini (structured application logs, query berdasarkan trace ID atau user ID), Loki lebih dari cukup.
