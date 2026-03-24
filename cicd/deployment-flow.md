@@ -1,3 +1,4 @@
+
 # C. Deployment Flow dan CI/CD
 
 > Deployment bukan sekadar "menjalankan kode baru di server". Deployment adalah proses terkontrol yang harus dapat diulang, dapat diaudit, aman untuk dijalankan kapanpun, dan memiliki escape hatch yang jelas saat sesuatu tidak berjalan sesuai rencana.
@@ -55,60 +56,7 @@ Rollback jika diperlukan (< 2 menit):
 
 ## 3. Pipeline Stages
 
-```
-[Push to branch]
-      │
-      ▼
-[Stage 1: Build & Lint]          ~2-3 menit
-  - Checkout code
-  - PHP/Node dependency installation
-  - Static analysis (PHPStan level 8, ESLint)
-  - Unit tests
-      │
-      ▼ (jika gagal → stop, notifikasi developer)
-[Stage 2: Security Scan]         ~3-5 menit
-  - Trivy: scan source code untuk secrets (secret detection)
-  - Trivy: scan Dockerfile dan base image untuk CVEs
-  - Blocklist: CRITICAL CVE tidak lolos tanpa explicit exception
-      │
-      ▼ (jika gagal → stop, buat issue otomatis)
-[Stage 3: Build Docker Image]    ~3-5 menit
-  - Multi-stage build
-  - Tag dengan git SHA (immutable) + branch tag (mutable)
-  - Push ke ECR
-      │
-      ▼
-[Stage 4: Integration Tests]     ~5-10 menit
-  - Deploy ke ephemeral test environment
-  - Run integration test suite
-  - Smoke test terhadap critical user flows
-  - Teardown ephemeral environment
-      │
-      ▼
-[Stage 5: Deploy ke Staging]     ~5 menit
-  - Auto-deploy ke staging environment
-  - Run staging smoke test
-  - Notifikasi team di Slack
-      │
-      ▼ (gate: hanya untuk main/production branch)
-[Stage 6: Production Approval]   Manual
-  - Required reviewers: 1 dari [lead-devops, tech-lead]
-  - Deployment window check (tidak deploy Jumat 17:00 - Senin 09:00)
-  - Approval timeout: 24 jam
-      │
-      ▼
-[Stage 7: Production Deploy]     ~5-8 menit
-  - Blue/Green swap
-  - Post-deploy health verification (2 menit)
-  - Synthetic transaction test
-  - Notifikasi Slack dengan deployment summary
-      │
-      ▼ (jika health check gagal)
-[Auto-Rollback]                  ~2 menit
-  - Revert ke previous target group
-  - Alert ke on-call engineer
-  - Create incident ticket otomatis
-```
+![enter image description here](https://res.cloudinary.com/djyvswx7e/image/upload/v1774320303/Screenshot_2026-03-24_094446_tvx99t.png)
 
 ---
 
