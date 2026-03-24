@@ -1,3 +1,4 @@
+
 # F. Security, Access Control, dan Secret Handling
 
 > Security baseline bukan checklist yang dicentang sekali lalu dilupakan. Ia adalah posture yang perlu di-maintain seiring sistem berubah. Setiap deployment baru, setiap engineer baru, setiap service baru adalah potensi permukaan risiko baru yang harus dinilai secara sadar.
@@ -195,7 +196,7 @@ On-call Engineer        ✅      ✅      ✅        ❌       ❌
 * Destroy harus melalui change request + second approval
 † Pipeline tidak bisa "read" production secrets — hanya bisa reference ARN-nya
 ```
-
+![enter image description here](https://res.cloudinary.com/djyvswx7e/image/upload/v1774320884/Screenshot_2026-03-24_095428_xwraed.png)
 ---
 
 ## 4. Secret Management
