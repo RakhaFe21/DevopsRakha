@@ -25,13 +25,7 @@ Asumsi-asumsi ini menentukan setiap keputusan desain yang mengikutinya. Infrastr
 
 Tiga environment wajib ada dengan **isolasi yang nyata** — bukan sekadar perbedaan nama atau prefix config:
 
-```
-Development  →  Staging  →  Production
-    ↑               ↑              ↑
- Per-engineer   Shared team   Live traffic
- ephemeral      persistent     persistent
- low-fidelity   high-fidelity  source of truth
-```
+![enter image description here](https://res.cloudinary.com/djyvswx7e/image/upload/v1774319379/Screenshot_2026-03-24_091815_y3dtxs.png)
 
 **Kesalahan umum yang saya hindari:**
 - Staging menggunakan production database dengan data yang di-mask. Ini bukan staging, ini adalah production dengan false sense of safety.
@@ -40,16 +34,7 @@ Development  →  Staging  →  Production
 
 ### Account Strategy
 
-```
-AWS Organization
-├── Management Account (billing, SCPs only)
-├── Development Account
-│   └── Per-feature ephemeral environments (via Terraform workspaces)
-├── Staging Account
-│   └── Persistent staging environment (mirrors production topology)
-└── Production Account
-    └── Production environment (hardened, restricted access)
-```
+![enter image description here](https://res.cloudinary.com/djyvswx7e/image/upload/v1774319379/Screenshot_2026-03-24_092357_cykvcl.png)
 
 Pemisahan per-AWS-account — bukan per-VPC dalam account yang sama — memberikan isolasi IAM yang sesungguhnya. SCPs (Service Control Policies) di organization level mencegah, misalnya, staging account membuat resources di region yang tidak diizinkan, atau mengubah billing configuration.
 
@@ -113,22 +98,7 @@ Satu NAT Gateway per AZ untuk high availability. Ini lebih mahal dari single NAT
 
 ## 4. Multi-AZ dan High Availability Design
 
-```
-                        Route 53 (Health Check + Failover)
-                               │
-                        ALB (Multi-AZ)
-                       /              \
-              AZ-a                    AZ-b
-              ────                    ────
-         App Servers              App Servers
-         (ASG min:2)              (ASG min:2)
-              │                        │
-         RDS Primary              RDS Standby
-         (AZ-a)          ←sync→   (AZ-b, Multi-AZ)
-              │
-         ElastiCache
-         (Cluster Mode)
-```
+![enter image description here](https://res.cloudinary.com/djyvswx7e/image/upload/v1774319379/Screenshot_2026-03-24_092558_ptceid.png)
 
 **RDS Multi-AZ** bukan read replica — ini adalah synchronous standby untuk automatic failover. Untuk read-heavy workload, read replicas ditambahkan secara terpisah di private data subnet.
 
@@ -157,25 +127,7 @@ Terraform state mengandung semua resource attributes termasuk initial passwords,
 
 ### Module Structure
 
-```
-terraform/
-├── environments/
-│   ├── dev/
-│   │   ├── main.tf
-│   │   ├── variables.tf
-│   │   └── terraform.tfvars
-│   ├── staging/
-│   └── production/
-├── modules/
-│   ├── vpc/
-│   ├── ecs-cluster/
-│   ├── rds/
-│   ├── alb/
-│   └── monitoring/
-└── global/
-    ├── iam/
-    └── route53/
-```
+![enter image description here](https://res.cloudinary.com/djyvswx7e/image/upload/v1774319379/Screenshot_2026-03-24_092447_jiecqp.png)
 
 **Prinsip module design:**
 - Module harus memiliki interface yang stabil (input/output) dan implementasi yang bisa berubah tanpa breaking consumers.
