@@ -1,3 +1,4 @@
+
 # G. Backup, Restore, dan Recovery Readiness
 
 > Backup yang belum pernah diuji adalah backup yang mungkin tidak berfungsi. Disaster recovery yang hanya ada di dokumen tapi belum pernah dipraktikkan adalah false confidence yang paling berbahaya. Kesiapan recovery diukur dari kemampuan menjawab satu pertanyaan: **"Jika server production hilang sekarang, berapa menit yang dibutuhkan untuk kembali normal?"**
@@ -18,6 +19,7 @@ Application server    0 (stateless) 5 menit       Container re-spawn dari image
 Config/secret loss    0 (IaC)       10 menit      Terraform re-apply
 Complete region down  1 jam         4 jam         DR ke secondary region
 ```
+![enter image description here](https://res.cloudinary.com/djyvswx7e/image/upload/v1774321122/Screenshot_2026-03-24_095622_ga5i3x.png)
 
 **Catatan penting:** RPO dan RTO harus disetujui oleh stakeholder bisnis, bukan hanya tim teknis. Mencapai RPO 1 detik dan RTO 0 adalah secara teknis mungkin tapi sangat mahal. Angka di atas adalah hasil trade-off antara cost dan business requirement.
 
@@ -27,19 +29,7 @@ Complete region down  1 jam         4 jam         DR ke secondary region
 
 ### PostgreSQL: Multi-Layer Backup
 
-```
-Layer 1: RDS Automated Backup (Continuous)
-  ├── WAL (Write-Ahead Log) streaming ke S3 → RPO: ~5 menit
-  ├── Full snapshot: setiap hari (retained 30 hari)
-  └── Point-in-Time Recovery tersedia untuk window 30 hari
-
-Layer 2: Manual Snapshot sebelum setiap major deployment
-  └── Retained minimal 7 hari setelah deployment
-
-Layer 3: Cross-region backup (untuk DR)
-  └── Daily snapshot copy ke ap-northeast-1 (Tokyo)
-      Retained 7 hari; digunakan untuk region failure scenario
-```
+![enter image description here](https://res.cloudinary.com/djyvswx7e/image/upload/v1774321122/Screenshot_2026-03-24_095707_x8jay7.png)
 
 **Konfigurasi RDS Backup:**
 
@@ -197,49 +187,39 @@ Action dari tim:
   4. RDS akan otomatis provision new standby di AZ sebelumnya
 ```
 
+
+## 4. Disaster Recovery Runbook
+
+### Skenario 1: Single Container Failure
+
+**Deteksi:**  ECS health check gagal  
+**Respons:**  ECS otomatis spawn replacement task  _(self-healing)_  
+**RTO:**  < 2 menit  
+**Action tim:**  Monitor replacement task sehat; investigasi root cause di ECS events.
+
+### Skenario 2: EC2 Host / AZ Failure
+
+**Deteksi:**  CloudWatch alarm + ECS service events  
+**Respons:**  ECS reschedule tasks ke healthy host di AZ lain  
+**RTO:**  < 5 menit  
+**Action tim:**  Verify traffic terdistribusi ke AZ yang tersisa; jika ASG tidak scale otomatis, trigger manual scale-out.
+
+### Skenario 3: Database Primary Failure
+
+**Deteksi:**  RDS Multi-AZ automated failover  _(triggered oleh RDS control plane)_  
+**Respons:**  RDS promote standby ke primary di AZ lain  
+**RTO:**  1–2 menit  _(automated failover)_  
+**Action tim:**
+
+1.  Verify aplikasi reconnect ke new primary — PHP PDO persistent connection mungkin perlu di-recycle
+2.  Pastikan connection pool error spike di Grafana sudah kembali normal
+3.  Investigate root cause di RDS Events tab
+4.  RDS otomatis provision new standby di AZ sebelumnya — monitor sampai selesai
+
 ### Skenario 4: Complete Region Failure (ap-southeast-1 down)
 
-```
-RTO Target: 4 jam
-RPO Target: 1 jam
-
-Step-by-step DR activation:
-
-1. DECLARE INCIDENT (t+0)
-   - Buka incident channel di Slack
-   - Notify stakeholders: "Region outage detected, activating DR"
-   - Assign incident commander
-
-2. ASSESS SCOPE (t+0 sampai t+15 menit)
-   - Konfirmasi: apakah ini genuinely region failure atau hanya partial outage?
-   - Cek AWS Service Health Dashboard
-   - Jika partial outage: mungkin tidak perlu full DR activation
-
-3. ACTIVATE DR DATABASE (t+15 sampai t+45 menit)
-   aws rds restore-db-instance-from-db-snapshot \
-     --db-instance-identifier myapp-dr-production \
-     --db-snapshot-identifier [latest cross-region snapshot] \
-     --db-instance-class db.r6g.large \
-     --region ap-northeast-1
-
-4. DEPLOY APPLICATION TO DR REGION (t+45 sampai t+120 menit)
-   - Terraform apply untuk DR environment (sudah di-maintain, bukan di-build from scratch)
-   - Docker image sudah di-copy ke ap-northeast-1 ECR (via cross-region replication)
-   - Update Secrets Manager entries di ap-northeast-1 dengan DR database endpoint
-
-5. VERIFY AND SMOKE TEST (t+120 sampai t+180 menit)
-   - Jalankan smoke test suite terhadap DR environment
-   - Verify critical user flows berfungsi
-
-6. TRAFFIC FAILOVER (t+180 sampai t+240 menit)
-   - Update Route 53 untuk point ke DR ALB
-   - TTL Route 53 sudah di-set ke 60 detik untuk failover yang cepat
-   - Monitor error rate di DR environment
-
-7. COMMUNICATION
-   - Update status page setiap 30 menit
-   - Notify ketika DR aktif dan layanan tersedia
-```
+**RTO Target: 4 jam | RPO Target: 1 jam**
+![enter image description here](https://res.cloudinary.com/djyvswx7e/image/upload/v1774321100/Screenshot_2026-03-24_095736_yjpiqd.png)
 
 ---
 
